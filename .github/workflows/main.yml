@@ -1,4 +1,3 @@
-
 name: 24/7 OK.ru Simple Stream Bot
 
 run-name: "OK.ru Live - Ch ${{ inputs.okru_stream_channel }} [${{ inputs.custom_duration || '24/7' }}]"
@@ -60,7 +59,6 @@ permissions:
 
 jobs:
   stream:
-    # Pin Ubuntu 24.04 (noble) for pre-installed Google Chrome + WidevineCdm & WARP apt support
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -90,6 +88,9 @@ jobs:
 
           echo "=== Runner OS ==="
           lsb_release -a || true
+
+          echo "=== JS Syntax Check ==="
+          node --check stream.js
 
       - name: Install & Connect Cloudflare WARP Proxy
         if: github.event.inputs.proxy_engine == 'Cloudflare WARP (Recommended)'
@@ -129,19 +130,18 @@ jobs:
           ENABLE_STREAM_AUDIO: ${{ github.event.inputs.enable_stream_audio }}
           CUSTOM_DURATION: ${{ github.event.inputs.custom_duration }}
         run: |
-          pulseaudio -D --exit-idle-time=-1
-          pacmd load-module module-virtual-sink sink_name=v1
-          pacmd set-default-sink v1
-          pacmd set-default-source v1.monitor
+          pulseaudio -D --exit-idle-time=-1 || true
+          pacmd load-module module-virtual-sink sink_name=v1 || true
+          pacmd set-default-sink v1 || true
+          pacmd set-default-source v1.monitor || true
 
-          # Match Xvfb screen size with selected stream quality
           SCREEN_RES="1280x720x24"
           if [[ "$STREAM_QUALITY" == *"1080p"* ]]; then SCREEN_RES="1920x1080x24"; fi
           if [[ "$STREAM_QUALITY" == "480p" ]]; then SCREEN_RES="854x480x24"; fi
           if [[ "$STREAM_QUALITY" == "360p" ]]; then SCREEN_RES="640x360x24"; fi
 
-          xvfb-run -a -s "-screen 0 $SCREEN_RES -ac -r -extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
-
+          echo "[*] Launching Xvfb ($SCREEN_RES) + Openbox + stream.js..."
+          xvfb-run -a -e /dev/stderr -s "-screen 0 $SCREEN_RES -ac +extension RANDR" bash -c "openbox & sleep 2 && node stream.js"
 
 
 
