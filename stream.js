@@ -1,106 +1,123 @@
+    const s = { dir: fs.mkdtempSync(path.join(os.tmpdir(), 'okru-chrome-check-')) };
+    try {
+        await startBrowser(s, { width: 1280, height: 720, audio: 'OFF', proxy: 'None' });
+        if (!await checkWidevine(s.page)) throw new Error('Chrome could not initialize Widevine with either tested codec.');
+    } finally { await closeSession(s); }
+}
 
-# 😂 SPORT4U ONLINE — JUST LOOK AT THE DP!
+async function closeSession(s) {
+    const jobs = [];
+    if (s.browser) {
+        jobs.push(bounded(s.browser.close(), 4000, 'Browser close').catch(() => {
+            s.browser.process()?.kill('SIGKILL');
+        }));
+    }
+    if (s.child) {
+        jobs.push((async () => {
+            if (!s.obsFailure) {
+                await bounded(s.obs.call('StopStream'), 2500, 'Stop stream').catch(() => {});
+            }
+            await bounded(s.obs.disconnect(), 1500, 'Disconnect').catch(() => {});
+            if (!s.obsFailure) {
+                s.child.kill('SIGTERM');
+                try { await bounded(s.exited, 4000, 'OBS exit'); }
+                catch { s.child.kill('SIGKILL'); await bounded(s.exited, 2000, 'OBS exit'); }
+            }
+        })());
+    }
+    try { await Promise.all(jobs); }
+    finally { await fs.promises.rm(s.dir, { force: true, recursive: true, maxRetries: 3, retryDelay: 200 }); }
+}
 
-**DURATION:** Exactly 10 Seconds  
-**FORMAT:** Vertical 9:16 — Reels / TikTok / Facebook  
-**STYLE:** Premium Pixar-style 3D comedy, natural acting, expressive facial animation, cinematic stadium atmosphere.
+async function jobBudget(signal) {
+    // The six-hour job limit also counts apt, npm, Chrome and virtual display setup.
+    const fallback = 320 * MINUTE;
+    try {
+        const repo = process.env.GITHUB_REPOSITORY;
+        const run = process.env.GITHUB_RUN_ID;
+        const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+        const result = await exec('gh', ['api', 'repos/' + repo + '/actions/runs/' + run +
+            '/attempts/' + attempt + '/jobs'], { timeout: 8000, signal });
+        const running = JSON.parse(result.stdout).jobs.filter(j => j.status === 'in_progress');
+        const job = running.find(j => j.name === process.env.GITHUB_JOB) || (running.length === 1 && running[0]);
+        const start = Date.parse(job?.started_at);
+        if (Number.isFinite(start)) return Math.max(1000, Math.min(350 * MINUTE, start + 350 * MINUTE - Date.now()));
+    } catch {
+        signal.throwIfAborted();
+    }
+    console.warn('Job start time unavailable. Reserving 40 minutes for setup and handoff.');
+    return fallback;
+}
 
-## 1. CHARACTER REFERENCE
+async function handoff(cfg, remaining, signal) {
+    const repository = process.env.GITHUB_REPOSITORY;
+    const ref = process.env.GITHUB_REF_NAME;
+    const workflowRef = process.env.GITHUB_WORKFLOW_REF || '';
+    const prefix = repository + '/.github/workflows/';
+    const workflow = workflowRef.slice(prefix.length).split('@')[0];
+    if (!workflowRef.startsWith(prefix) || !/^[\w. -]+\.ya?ml$/i.test(workflow) || !ref) {
+        throw new Error('Cannot identify the workflow and ref for the next run.');
+    }
+    const inputs = {
+        target_urls: cfg.raw, okru_stream_channel: cfg.channel, server_selection: cfg.server,
+        stream_quality: cfg.quality, proxy_engine: cfg.proxy, enable_stream_audio: cfg.audio,
+        custom_duration: remaining === Infinity ? '24/7' : Math.ceil(remaining / 1000) + 's',
+    };
+    const args = ['workflow', 'run', workflow, '--repo', repository, '--ref', ref];
+    for (const [name, value] of Object.entries(inputs)) args.push('-f', name + '=' + value);
+    // A timed-out dispatch can have reached GitHub. Repeating it can create two publishers.
+    try { await exec('gh', args, { timeout: 20_000, signal }); }
+    catch (err) {
+        signal.throwIfAborted();
+        const detail = String(err.stderr || '').match(/HTTP \d{3}/i)?.[0] || err.code || 'timeout';
+        throw new Error('Workflow dispatch could not be confirmed (' + detail + '). Check Actions run history.');
+    }
+    console.log('GitHub accepted the next workflow run.');
+}
 
-Use the uploaded reference image.
+async function main() {
+    const cfg = settings(process.env);
+    if (!process.env.DISPLAY) throw new Error('DISPLAY is missing. Launch stream.js inside the workflow Xvfb session.');
+    const life = new AbortController();
+    const cancel = () => life.abort(new Error('Workflow cancelled.'));
+    process.once('SIGTERM', cancel);
+    process.once('SIGINT', cancel);
+    let timer;
+    try {
+        const budget = process.env.GITHUB_ACTIONS === 'true' ? await jobBudget(life.signal) : Infinity;
+        const slice = Math.min(cfg.duration, budget);
+        const status = { index: 0, lastLive: 0, started: Date.now() };
+        const session = new AbortController();
+        const signal = AbortSignal.any([session.signal, life.signal]);
+        // Long local durations can exceed Node's maximum individual timeout.
+        const deadline = status.started + slice;
+        function armTimer() {
+            const left = deadline - Date.now();
+            if (left <= 0) session.abort(new Error('Duration reached.'));
+            else if (Number.isFinite(left)) timer = setTimeout(armTimer, Math.min(left, 2_147_483_647));
+        }
+        armTimer();
+        console.log('Starting OK.ru channel ' + cfg.channel + ' at ' + cfg.quality + ', audio ' + cfg.audio + '.');
+        try { await supervise(cfg, signal, status); }
+        catch (err) { if (!signal.aborted) throw err; }
+        life.signal.throwIfAborted();
+        if (!status.lastLive) throw new Error('Duration ended before OBS confirmed outgoing media.');
+        if (Date.now() - status.lastLive > 90_000 && cfg.duration <= slice) {
+            throw new Error('Duration ended during an extended source or output outage.');
+        }
+        if (cfg.duration > slice) await handoff(cfg, cfg.duration - slice, life.signal);
+        else console.log('Requested duration complete.');
+    } finally {
+        clearTimeout(timer);
+        process.removeListener('SIGTERM', cancel);
+        process.removeListener('SIGINT', cancel);
+    }
+}
 
-Take the exact head and facial appearance from the reference image. Preserve the identity and recognizable features.
+if (require.main === module) {
+    (process.argv.includes('--check-browser') ? browserCheck() : main()).catch(err => { console.error(safeMessage(err)); process.exitCode = 1; });
+}
 
-The character wears a stylish jacket, black sunglasses and fashionable sneakers.
-
-## 2. STORYBOARD — EXACTLY 10 SECONDS
-
-### 0–3 SECONDS — HE KNOWS WHY YOU ARE HERE
-
-The potato stands casually between two spectacular stadium environments.
-
-Left side: A massive football stadium with players, a football and cheering crowds.
-
-Right side: A spectacular cricket stadium with batsmen, bowlers and a live match atmosphere.
-
-The potato notices the camera, gives a knowing smile and slowly raises one eyebrow.
-
-He casually says:
-
-**"Ohhh... I see why you're here!"**
-
-He gives a small knowing nod.
-
-### 3–6 SECONDS — THE DP HINT
-
-The potato slowly turns towards the camera.
-
-He raises one finger and gently points towards the viewer's profile-picture area.
-
-He then makes a small circular gesture with his finger, as if telling the viewer to look carefully.
-
-He smiles and says slowly, naturally and confidently:
-
-**"Do one thing... Take a closer look at our account's profile picture."**
-
-IMPORTANT: He must say this calmly, like a friend sharing a clever little secret. No shouting, no panic and no rushed dialogue.
-
-### 6–8 SECONDS — LET THE ACTION EXPLAIN
-
-The potato looks towards the viewer's profile-picture direction.
-
-He gently taps his sunglasses, points towards the DP again and gives a subtle wink.
-
-Behind him, football and cricket stadium screens illuminate simultaneously.
-
-He says:
-
-**"That's it... Just get the hint!"**
-
-### 8–10 SECONDS — THE FINAL REACTION
-
-The potato adjusts his sunglasses, gives a confident smile and performs a tiny funny shoulder dance.
-
-He points towards the DP one last time.
-
-**FINAL DIALOGUE:**
-
-**"A smart person only needs a little hint!"**
-
-End with a funny wink, stadium fireworks and a freeze-frame.
-
-## 3. INTERFACE & VISUAL DIRECTION
-
-- A clean, modern social-media-style interface is already open in the background.
-- Keep the interface visible naturally; do not show typing or a Google search.
-- The profile picture area should be visually recognizable.
-- Do not zoom into a search bar.
-- Do not create fake website navigation.
-- The character's finger gestures must clearly direct attention towards the DP.
-- Football and cricket must both remain visible.
-
-## 4. VOICE & SOUND DESIGN
-
-- Natural conversational English male voice.
-- Relaxed, clever and slightly mischievous delivery.
-- Clear pronunciation and accurate lip synchronization.
-- Soft energetic hip-hop background music.
-- Subtle whoosh sounds when pointing.
-- Funny pop sound during the wink.
-- Stadium crowd ambience and cinematic ending beat.
-
-## 5. STRICT REQUIREMENTS
-
-1. Exactly 10 seconds.
-2. Use the uploaded reference image for the character's head.
-3. Never verbally reveal the website name.
-4. No Google search, no typing animation and no search-bar zoom.
-5. No banned, police or panic dialogue.
-6. The DP gesture must be slow, clear and understandable.
-7. Make the character look directly at the viewer.
-8. The viewer should understand the hint through actions, not lengthy explanations.
-9. No unnecessary text or additional logos.
-10. Maintain premium animation quality throughout.
 
 
 
