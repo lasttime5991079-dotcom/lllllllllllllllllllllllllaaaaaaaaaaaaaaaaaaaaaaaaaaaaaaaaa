@@ -15,19 +15,11 @@ const obs = new OBSWebSocket();
 // =========================================================================================
 // ⚙️ CONFIGURATION & ENV VARIABLES
 // =========================================================================================
-const selectedQuality = process.env.STREAM_QUALITY |
-
-| '720p';
-const PROXY_ENGINE = process.env.PROXY_ENGINE |
-
-| 'Cloudflare WARP (Recommended)';
+const selectedQuality = process.env.STREAM_QUALITY || '720p';
+const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)';
 const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
-const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID |
-
-| '1').trim();
-const WINDOW_KEEPER = (process.env.WINDOW_KEEPER |
-
-| 'ON').trim().toUpperCase();
+const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
+const WINDOW_KEEPER = (process.env.WINDOW_KEEPER || 'ON').trim().toUpperCase();
 const CHROME_PROFILE_DIR = path.join(os.tmpdir(), 'chrome-drm-profile');
 
 let RES_W = 1280, RES_H = 720, BITRATE = 3000;
@@ -96,16 +88,12 @@ const STREAM_KEYS = {
     's2.10': '14206184136239_14849618610735_ihnbx7hkoi'
 };
 
-const ACTIVE_STREAM_KEY = STREAM_KEYS[SELECTED_CHANNEL] |
-
-| STREAM_KEYS['1'];
+const ACTIVE_STREAM_KEY = STREAM_KEYS[SELECTED_CHANNEL] || STREAM_KEYS['1'];
 
 // =========================================================================================
 // 🔗 TARGET URLS (Supports fallback list separated by comma or pipe)
 // =========================================================================================
-const rawUrls = (process.env.TARGET_URLS |
-
-| 'https://dadocric.st/player.php?id=starsp3&v=m').trim();
+const rawUrls = (process.env.TARGET_URLS || 'https://dadocric.st/player.php?id=starsp3&v=m').trim();
 const candidateUrls = rawUrls
     .split(/[,|]/)
     .map(u => {
@@ -183,12 +171,8 @@ async function verifyPlaybackTelemetry(page, http403Urls) {
         try {
             const info = await frame.evaluate(async () => {
                 const errEl = document.querySelector('.jw-error-msg, .jw-title-primary, [class*="error"]');
-                const errText = errEl ? (errEl.innerText |
-
-| '').trim() : '';
-                const bodyText = document.body ? (document.body.innerText |
-
-| '').slice(0, 400) : '';
+                const errText = errEl ? (errEl.innerText || '').trim() : '';
+                const bodyText = document.body ? (document.body.innerText || '').slice(0, 400) : '';
                 const hasProtectedError = /problem providing access to protected content|232403|233403|225403/i.test(errText + ' ' + bodyText);
 
                 const v = document.querySelector('video');
@@ -205,9 +189,7 @@ async function verifyPlaybackTelemetry(page, http403Urls) {
                         const timer = setTimeout(finish, 3000);
                         const onFrame = (_now, meta) => {
                             callbackFrames++;
-                            lastPresented = meta.presentedFrames |
-
-| callbackFrames;
+                            lastPresented = meta.presentedFrames || callbackFrames;
                             if (callbackFrames >= 3) {
                                 clearTimeout(timer);
                                 finish();
@@ -233,17 +215,13 @@ async function verifyPlaybackTelemetry(page, http403Urls) {
                     errText
                 };
             });
-            if (info && (info.hasVideo |
-
-| info.hasProtectedError)) {
+            if (info && (info.hasVideo || info.hasProtectedError)) {
                 frameResults.push(info);
             }
         } catch (e) {}
     }
 
-    const playing = frameResults.some(r => r.hasVideo && (r.endTime > r.startTime |
-
-| r.callbackFrames >= 2) && !r.hasProtectedError);
+    const playing = frameResults.some(r => r.hasVideo && (r.endTime > r.startTime || r.callbackFrames >= 2) && !r.hasProtectedError);
     console.log('[📊 Playback Telemetry]:', JSON.stringify({ playing, http403Count: http403Urls.length, frames: frameResults }));
     if (http403Urls.length > 0) {
         console.error('[🚫 HTTP 403 Blocked URLs (causes JW 232403/233403)]:', http403Urls.slice(0, 5));
@@ -368,9 +346,7 @@ function hideOBSAndFocusChrome() {
 }
 
 function startWindowKeeper() {
-    if (WINDOW_KEEPER === 'OFF' |
-
-| keeperTimer) return;
+    if (WINDOW_KEEPER === 'OFF' || keeperTimer) return;
     keeperTimer = setInterval(hideOBSAndFocusChrome, 2000);
 }
 
@@ -396,9 +372,7 @@ async function playAndMaximizeOnce(page) {
                 if (v.paused) v.play().catch(() => {});
                 v.muted = !audioEnabled;
                 v.volume = audioEnabled ? 1.0 : 0.0;
-                const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player]') |
-
-| v;
+                const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player]') || v;
                 wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
                 v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
                 return;
@@ -434,9 +408,7 @@ async function startSimpleBroadcast() {
         '--disable-shutdown-check',
         '--disable-missing-files-check'
     ], {
-        env: { ...process.env, DISPLAY: process.env.DISPLAY |
-
-| ':99' },
+        env: { ...process.env, DISPLAY: process.env.DISPLAY || ':99' },
         stdio: 'ignore'
     });
 
@@ -477,10 +449,6 @@ async function startSimpleBroadcast() {
         }
     }
 
-    // CRITICAL FIXES FOR PROTECTED CONTENT / WIDEVINE:
-    // 1. channel: 'chrome' -> uses Google Chrome (with WidevineCdm), not bundled Chrome for Testing
-    // 2. ignoreDefaultArgs includes '--disable-component-update' -> allows WidevineCdm to initialize
-    // 3. userDataDir -> persistent writable profile for CDM state
     browser = await puppeteer.launch({
         channel: 'chrome',
         headless: false,
@@ -510,7 +478,6 @@ async function startSimpleBroadcast() {
         }
     });
 
-    // Try candidate URLs in order until one passes playback telemetry
     for (const url of candidateUrls) {
         http403Urls.length = 0;
         console.log(`[🌐] Opening URL: ${url}`);
@@ -543,28 +510,18 @@ async function cleanup() {
     try { await obs.disconnect(); } catch (e) {}
     if (browser) { try { await browser.close(); } catch (e) {} }
     if (obsProcess) { try { obsProcess.kill('SIGKILL'); } catch (e) {} }
-    try { execSync('pkill -9 obs chrome |
-
-| true', { stdio: 'ignore' }); } catch (e) {}
+    try { execSync('pkill -9 obs chrome || true', { stdio: 'ignore' }); } catch (e) {}
 }
 
 // =========================================================================================
 // ⏱️ DURATION TIMER
 // =========================================================================================
-const RAW_DURATION = (process.env.CUSTOM_DURATION |
-
-| '24/7').trim();
+const RAW_DURATION = (process.env.CUSTOM_DURATION || '24/7').trim();
 const MAX_SINGLE_RUN_MS = 21000000; // 5h 50m
 
 function parseFlexibleDuration(input) {
-    const str = (input |
-
-| '').toLowerCase().trim();
-    if (!str |
-
-| str === '24/7' |
-| str === 'infinite' |
-| str === '0') return null;
+    const str = (input || '').toLowerCase().trim();
+    if (!str || str === '24/7' || str === 'infinite' || str === '0') return null;
     let totalMs = 0, matched = false;
     const regex = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/g;
     let match;
@@ -583,23 +540,17 @@ function formatMsToDurationString(ms) {
     const totalSec = Math.max(1, Math.round(ms / 1000));
     const h = Math.floor(totalSec / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
-    return [h > 0 ? `${h}h` : '', m > 0 ? `${m}m` : ''].filter(Boolean).join(' ') |
-
-| '1m';
+    return [h > 0 ? `${h}h` : '', m > 0 ? `${m}m` : ''].filter(Boolean).join(' ') || '1m';
 }
 
 function triggerNextWorkflow(nextDurationValue) {
     const args = [
         'workflow', 'run', 'main.yml',
-        '-f', `target_urls=${process.env.TARGET_URLS |
-
-| ''}`,
+        '-f', `target_urls=${process.env.TARGET_URLS || ''}`,
         '-f', `okru_stream_channel=${SELECTED_CHANNEL}`,
         '-f', `stream_quality=${selectedQuality}`,
         '-f', `proxy_engine=${PROXY_ENGINE}`,
-        '-f', `enable_stream_audio=${process.env.ENABLE_STREAM_AUDIO |
-
-| 'ON'}`,
+        '-f', `enable_stream_audio=${process.env.ENABLE_STREAM_AUDIO || 'ON'}`,
         '-f', `custom_duration=${nextDurationValue}`
     ];
     const res = spawn('gh', args, { stdio: 'inherit' });
@@ -619,6 +570,11 @@ if (totalRequestedMs === null) {
 }
 
 startSimpleBroadcast();
+
+
+
+
+
 
 
 
