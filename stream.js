@@ -1,26 +1,42 @@
-'use strict';
-
-// Linux x64 / Xvfb / desktop Google Chrome. Use the existing workflow and package.json.
-// Browser-only check: xvfb-run -a node stream.js --check-browser
-// Normal launch: node stream.js (inside the workflow's Xvfb session).
-// Chrome handles Widevine through its own CDM. Each provider decides license and output rights.
-// https://developers.google.com/widevine/drm/overview
-// https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { spawn, execFile } = require('node:child_process');
-const { promisify } = require('node:util');
-const { setTimeout: sleep } = require('node:timers/promises');
 const puppeteer = require('puppeteer');
+
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+const os = require('os');
+const { spawn, execSync } = require('child_process');
 const { OBSWebSocket } = require('obs-websocket-js');
 
-const exec = promisify(execFile);
-const MINUTE = 60_000;
-const INGEST = 'rtmp://vsu.okcdn.ru/input/';
-const DEFAULT_SOURCE = 'https://dadocric.st/player.php?id=starsp3&v=m';
+process.on('uncaughtException', (err) => console.error('[💥] UNCAUGHT EXCEPTION:', err.message));
+process.on('unhandledRejection', (reason) => console.error('[💥] UNHANDLED REJECTION:', reason));
 
+const obs = new OBSWebSocket();
+
+// =========================================================================================
+// ⚙️ CONFIGURATION & ENV VARIABLES
+// =========================================================================================
+const selectedQuality = process.env.STREAM_QUALITY |
+
+| '720p';
+const PROXY_ENGINE = process.env.PROXY_ENGINE |
+
+| 'Cloudflare WARP (Recommended)';
+const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
+const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID |
+
+| '1').trim();
+const WINDOW_KEEPER = (process.env.WINDOW_KEEPER |
+
+| 'ON').trim().toUpperCase();
+const CHROME_PROFILE_DIR = path.join(os.tmpdir(), 'chrome-drm-profile');
+
+let RES_W = 1280, RES_H = 720, BITRATE = 3000;
+if (selectedQuality === '360p') { RES_W = 640; RES_H = 360; BITRATE = 800; }
+else if (selectedQuality === '480p') { RES_W = 854; RES_H = 480; BITRATE = 1500; }
+else if (selectedQuality === '720p') { RES_W = 1280; RES_H = 720; BITRATE = 3000; }
+else if (selectedQuality.includes('1080p')) { RES_W = 1920; RES_H = 1080; BITRATE = 4500; }
+
+// 🔒 STREAM KEYS (UNTOUCHED)
 const STREAM_KEYS = {
     '1'    : '15254238731883_15281627925099_najspfkgne',
     '1.1'  : '15254260751979_15281671637611_2plrcfqzze',
@@ -80,555 +96,529 @@ const STREAM_KEYS = {
     's2.10': '14206184136239_14849618610735_ihnbx7hkoi'
 };
 
-const qualities = new Map([
-    ['360p', [640, 360, 800]],
-    ['480p', [854, 480, 1500]],
-    ['720p', [1280, 720, 3000]],
-    ['1080p', [1920, 1080, 4500]],
-    ['Original (1080p Max)', [1920, 1080, 4500]],
-]);
+const ACTIVE_STREAM_KEY = STREAM_KEYS[SELECTED_CHANNEL] |
 
-function durationMs(input) {
-    const value = input.trim().toLowerCase();
-    if (['24/7', 'infinite', 'forever', '0'].includes(value)) return Infinity;
-    let ms = 0;
-    if (/^\d+(?:\.\d+)?$/.test(value)) {
-        ms = Number(value) * MINUTE;
-    } else {
-        const token = /\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/gy;
-        let offset = 0;
-        while (offset < value.length) {
-            const part = token.exec(value);
-            if (!part) throw new Error('Invalid CUSTOM_DURATION. Examples: 45m, 1h 10min, 24/7.');
-            ms += Number(part[1]) * ({ h: 3_600_000, m: MINUTE, s: 1000 })[part[2][0]];
-            offset = token.lastIndex;
-        }
-    }
-    ms = Math.round(ms);
-    if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error('CUSTOM_DURATION must be positive.');
-    return ms;
+| STREAM_KEYS['1'];
+
+// =========================================================================================
+// 🔗 TARGET URLS (Supports fallback list separated by comma or pipe)
+// =========================================================================================
+const rawUrls = (process.env.TARGET_URLS |
+
+| 'https://dadocric.st/player.php?id=starsp3&v=m').trim();
+const candidateUrls = rawUrls
+    .split(/[,|]/)
+    .map(u => {
+        let clean = u.split('::')[0].trim().replace(/^!/, '');
+        if (clean && !clean.startsWith('http')) clean = 'https://' + clean;
+        return clean;
+    })
+    .filter(u => u.length > 8);
+
+if (candidateUrls.length === 0) {
+    candidateUrls.push('https://dadocric.st/player.php?id=starsp3&v=m');
 }
 
-function settings(env) {
-    const channel = (env.OKRU_STREAM_ID || '1').trim();
-    if (!Object.hasOwn(STREAM_KEYS, channel)) throw new Error('Unknown OKRU_STREAM_ID.');
-    const quality = (env.STREAM_QUALITY || '720p').trim();
-    if (!qualities.has(quality)) throw new Error('Unknown STREAM_QUALITY.');
-    const audio = (env.ENABLE_STREAM_AUDIO || 'ON').trim().toUpperCase();
-    if (!['ON', 'OFF'].includes(audio)) throw new Error('ENABLE_STREAM_AUDIO must be ON or OFF.');
-    const raw = env.TARGET_URLS ?? DEFAULT_SOURCE;
-    const urls = raw.split(/[,|\n]/).map(s => s.trim()).filter(Boolean).map(s => {
-        // The previous file also accepted "!host/path::label".
-        const value = s.replace(/^!/, '').replace(/::[^/\]:]*$/, '');
-        if (!value) throw new Error('Empty source URL.');
-        let url;
-        try {
-            url = new URL(/^[\w+.-]+:\/\//.test(value) ? value : 'https://' + value);
-        } catch {
-            throw new Error('Invalid URL in TARGET_URLS.');
-        }
-        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Sources must use HTTP or HTTPS.');
-        return url.href;
-    });
-    if (!urls.length) throw new Error('Provide at least one source in TARGET_URLS.');
-    const [width, height, bitrate] = qualities.get(quality);
-    return { channel, quality, audio, width, height, bitrate, raw, urls,
-        server: (env.SERVER_SELECTION || 'None').trim(),
-        proxy: (env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)').trim(),
-        duration: durationMs(env.CUSTOM_DURATION || '24/7') };
-}
+let browser = null;
+let browserPid = null;
+let obsProcess = null;
+let keeperTimer = null;
 
-function safeMessage(error) {
-    let msg = String(error?.message || error).split('\n')[0];
-    for (const secret of [...Object.values(STREAM_KEYS), process.env.GH_TOKEN, process.env.GITHUB_TOKEN]) {
-        if (secret) msg = msg.replaceAll(secret, '[redacted]');
-    }
-    return msg.replace(/(?:https?|rtmps?|wss?):\/\/\S+/gi, '[URL]').slice(0, 250);
-}
-
-function bounded(promise, ms, label) {
-    let timer;
-    return Promise.race([promise, new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(label + ' timed out')), ms);
-    })]).finally(() => clearTimeout(timer));
-}
-
-function mediaEnvironment() {
-    const env = { ...process.env };
-    for (const name of Object.keys(env)) {
-        if (/TOKEN|PASSWORD|SECRET/i.test(name)) delete env[name];
-    }
-    return env;
-}
-
-function writeProfile(dir, cfg, password) {
-    const root = path.join(dir, 'obs-studio');
-    function write(name, text) {
-        const file = path.join(root, name);
-        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        fs.writeFileSync(file, text, { mode: 0o600 });
-    }
-    const ws = '[OBSWebSocket]\nFirstLoad=false\nServerEnabled=true\nAuthRequired=true\nServerPort=4455\nServerPassword=' + password + '\n';
-    const general = '[General]\nLicenseAccepted=true\nFirstRun=true\n' +
-        '[BasicWindow]\nShowAutoConfig=false\nWarnBeforeStartingStream=false\nWarnBeforeStoppingStream=false\n' +
-        '[Basic]\nProfile=Live\nProfileDir=Live\nSceneCollection=Live\nSceneCollectionFile=Live\n';
-    for (const name of ['global.ini', 'user.ini']) write(name, general + ws);
-    write('plugin_config/obs-websocket/config.json', JSON.stringify({
-        first_load: false, server_enabled: true, server_port: 4455,
-        auth_required: true, server_password: password, alerts_enabled: false,
-    }));
-    write('basic/profiles/Live/basic.ini', '[General]\nName=Live\n' +
-        '[Video]\nBaseCX=' + cfg.width + '\nBaseCY=' + cfg.height +
-        '\nOutputCX=' + cfg.width + '\nOutputCY=' + cfg.height + '\nFPSType=0\nFPSCommon=30\n' +
-        '[Audio]\nSampleRate=48000\nChannelSetup=Stereo\n' +
-        '[Output]\nMode=Advanced\nReconnect=true\nRetryDelay=2\nMaxRetries=20\n' +
-        '[AdvOut]\nEncoder=obs_x264\nTrackIndex=1\nTrack1Bitrate=128\nApplyServiceSettings=false\n');
-    write('basic/profiles/Live/streamEncoder.json', JSON.stringify({
-        rate_control: 'CBR', bitrate: cfg.bitrate, keyint_sec: 2, preset: 'veryfast', profile: 'main',
-    }));
-    write('basic/scenes/Live.json', JSON.stringify({
-        name: 'Live', current_scene: 'Standby', current_program_scene: 'Standby',
-        scene_order: [{ name: 'Standby' }],
-        sources: [{ id: 'scene', name: 'Standby', settings: { items: [] } }],
-    }));
-}
-
-async function startObs(session, cfg, signal) {
-    const password = crypto.randomBytes(24).toString('hex');
-    writeProfile(session.dir, cfg, password);
-    const child = spawn('obs', ['--profile', 'Live', '--collection', 'Live', '--scene', 'Standby',
-        '--minimize-to-tray', '--disable-shutdown-check', '--disable-updater'],
-        { env: { ...mediaEnvironment(), XDG_CONFIG_HOME: session.dir }, stdio: 'ignore' });
-    session.child = child;
-    session.exited = new Promise(resolve => {
-        child.once('error', err => { session.obsFailure = err; resolve(); });
-        child.once('exit', (code, sig) => {
-            session.obsFailure = new Error('OBS exited (' + (sig || code) + ').');
-            resolve();
-        });
-    });
-    const until = Date.now() + 45_000;
-    while (true) {
-        signal.throwIfAborted();
-        if (session.obsFailure) throw session.obsFailure;
-        try {
-            await bounded(session.obs.connect('ws://127.0.0.1:4455', password), 5000, 'OBS connection');
-            break;
-        } catch {
-            if (Date.now() >= until) throw new Error('OBS WebSocket unavailable. Check OBS, its WebSocket plugin and DISPLAY.');
-            await sleep(750, undefined, { signal });
-        }
-    }
-    const call = session.call;
-    await call('CreateScene', { sceneName: 'Program' });
-    const special = await call('GetSpecialInputs');
-    for (const inputName of Object.values(special).filter(Boolean)) {
-        await call('SetInputMute', { inputName, inputMuted: true });
-    }
-    await call('CreateInput', { sceneName: 'Program', inputName: 'Display capture',
-        inputKind: 'xshm_input', inputSettings: { screen: 0, show_cursor: false }, sceneItemEnabled: true });
-    if (cfg.audio === 'ON') {
-        await call('CreateInput', { sceneName: 'Program', inputName: 'Program audio',
-            inputKind: 'pulse_output_capture', inputSettings: { device_id: 'default' }, sceneItemEnabled: true });
-    }
-    await call('SetStreamServiceSettings', {
-        streamServiceType: 'rtmp_custom',
-        streamServiceSettings: { server: INGEST, key: STREAM_KEYS[cfg.channel].trim(), use_auth: false },
+// =========================================================================================
+// 🔌 PROXY & DRM PREFLIGHT HELPERS
+// =========================================================================================
+function isPortOpen(host, port, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        let settled = false;
+        const done = (ok) => {
+            if (!settled) {
+                settled = true;
+                socket.destroy();
+                resolve(ok);
+            }
+        };
+        socket.setTimeout(timeoutMs);
+        socket.once('connect', () => done(true));
+        socket.once('timeout', () => done(false));
+        socket.once('error', () => done(false));
+        socket.connect(port, host);
     });
 }
 
-function fitElement(element) {
-    if (!element) return;
-    const props = { position: 'fixed', inset: '0', width: '100vw', height: '100vh',
-        'max-width': 'none', 'max-height': 'none', margin: '0', border: '0',
-        background: 'black', 'object-fit': 'contain', 'z-index': '2147483647' };
-    for (const [name, value] of Object.entries(props)) element.style.setProperty(name, value, 'important');
-}
-
-async function installedChrome() {
-    const override = process.env.CHROME_BIN || process.env.PUPPETEER_EXECUTABLE_PATH;
-    const candidates = override ? [override] : [
-        '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/opt/google/chrome/google-chrome',
-    ];
-    for (const file of candidates) {
-        try {
-            const { stdout } = await exec(file, ['--version'], { timeout: 5000, env: mediaEnvironment() });
-            const match = /^Google Chrome (\d+(?:\.\d+){3})(?:\s|$)/m.exec(stdout);
-            if (match) return { file, version: match[1] };
-        } catch {}
-    }
-    throw new Error('Google Chrome Stable was not found. Set CHROME_BIN to its executable on the Linux x64 runner.');
-}
-
-async function startBrowser(s, cfg) {
-    const { file, version } = await installedChrome();
-    console.log('Launching Google Chrome ' + version + ' on ' + process.env.DISPLAY);
-    const args = ['--kiosk', '--start-fullscreen', '--window-position=0,0',
-        '--window-size=' + cfg.width + ',' + cfg.height, '--disable-dev-shm-usage',
-        '--autoplay-policy=no-user-gesture-required'];
-    if (cfg.audio === 'OFF') args.push('--mute-audio');
-    if (cfg.proxy.includes('Cloudflare')) args.push('--proxy-server=socks5://127.0.0.1:40000');
-    s.browser = await puppeteer.launch({
-        executablePath: file, headless: false, defaultViewport: null, args, env: mediaEnvironment(),
-        userDataDir: path.join(s.dir, 'chrome'), timeout: 30_000, protocolTimeout: 15_000,
-        handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
-        ignoreDefaultArgs: ['--disable-component-update', '--disable-background-networking',
-            '--disable-component-extensions-with-background-pages'],
-    }).catch(err => {
-        if (/sandbox|zygote/i.test(err.message)) throw new Error('Chrome startup failed. Check the sandbox helper and permissions of the installed Google Chrome package.');
-        if (/X server|X display|DISPLAY/.test(err.message)) throw new Error('Chrome could not connect to the Xvfb display.');
-        throw err;
-    });
-    s.page = (await s.browser.pages())[0] || await s.browser.newPage();
-    s.page.on('error', () => { s.pageFailed = true; });
-    s.page.on('popup', popup => popup?.close().catch(() => {}));
-    s.page.on('dialog', dialog => dialog.dismiss().catch(() => {}));
-}
-
-// Probe a trustworthy local origin. No media, license request or site credential is used.
-async function checkWidevine(page) {
-    const server = require('node:http').createServer((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' });
-        res.end('<!doctype html><title>Chrome media check</title>');
-    });
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', resolve);
-    });
+async function checkWidevineCapability(page) {
     try {
-        await page.goto('http://127.0.0.1:' + server.address().port, { waitUntil: 'load', timeout: 8000 });
-        const results = await page.evaluate(async () => {
-            if (!window.isSecureContext || !navigator.requestMediaKeySystemAccess) return ['EME API unavailable'];
-            return Promise.all([
-                ['H.264', 'video/mp4; codecs="avc1.42E01E"', 'cenc'],
-                ['VP9', 'video/webm; codecs="vp9"', 'webm'],
-            ].map(async ([label, contentType, initDataType]) => {
-                try {
-                    const access = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{
-                        initDataTypes: [initDataType], videoCapabilities: [{ contentType }],
-                        distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed', sessionTypes: ['temporary'],
-                    }]);
-                    await access.createMediaKeys();
-                    return label + ' CDM initialized';
-                } catch (error) { return label + ' ' + error.name; }
-            }));
+        const result = await page.evaluate(async () => {
+            if (!navigator.requestMediaKeySystemAccess) {
+                return { supported: false, error: 'EME API unavailable (non-HTTPS or disabled)' };
+            }
+            const configs = [{
+                initDataTypes: ['cenc'],
+                audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }],
+                videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }]
+            }];
+            try {
+                const access = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', configs);
+                return { supported: true, keySystem: access.keySystem };
+            } catch (err) {
+                return { supported: false, error: `${err.name}: ${err.message}` };
+            }
         });
-        console.log('Widevine on this runner: ' + results.join(' | '));
-        return results.some(line => line.endsWith(' CDM initialized'));
-    } finally {
-        server.closeAllConnections();
-        await new Promise(resolve => server.close(resolve));
-    }
-}
-
-function observeMediaEvents() {
-    const states = new WeakMap();
-    Object.defineProperty(window, '__okruMediaState', { value: v => states.get(v) || '' });
-    for (const event of ['encrypted', 'waitingforkey', 'playing', 'emptied']) {
-        document.addEventListener(event, e => {
-            if (e.target instanceof HTMLMediaElement) states.set(e.target, event);
-        }, true);
-    }
-}
-
-function inspectVideo() {
-    const videos = [...document.querySelectorAll('video')];
-    const largest = videos.map((v, index) => {
-        const rect = v.getBoundingClientRect();
-        return { v, index, area: rect.width * rect.height };
-    }).filter(x => x.area > 0).sort((a, b) => b.area - a.area)[0];
-    if (!largest) return null;
-    const { v, index, area } = largest;
-    const drm = document.permissionsPolicy || document.featurePolicy;
-    return { index, area, time: v.currentTime, paused: v.paused, ready: v.readyState,
-        frames: v.getVideoPlaybackQuality?.().totalVideoFrames ?? null, error: v.error?.code || 0,
-        event: window.__okruMediaState?.(v) || '', secure: isSecureContext,
-        policy: drm?.allowsFeature?.('encrypted-media') ?? null };
-}
-
-async function getPlayer(page) {
-    const candidates = await Promise.all(page.frames().map(async frame => ({
-        frame, data: await frame.evaluate(inspectVideo).catch(() => null),
-    })));
-    return candidates.filter(c => c.data).sort((a, b) => b.data.area - a.data.area)[0];
-}
-
-function diagnostic(data) {
-    if (!data) return 'No visible HTML video element';
-    const errors = ['none', 'aborted', 'network', 'decode', 'source or format unsupported'];
-    return 'readyState=' + data.ready + ', mediaError=' + (errors[data.error] ?? data.error) +
-        ', event=' + (data.event || 'none') + ', secureContext=' + data.secure +
-        ', encrypted-media policy=' + (data.policy ?? 'unknown');
-}
-
-function stallHint(data) {
-    if (!data) return 'Check whether the source displayed a sign-in screen or player error.';
-    if (data.event === 'waitingforkey') return 'The player is waiting for a usable license key. Check the provider session and its device requirements.';
-    if (!data.secure) return 'Encrypted playback requires a secure context in the player frame.';
-    if (data.policy === false) return 'This frame disallows encrypted-media. For a DRM source, the embedding site must grant that permission.';
-    return 'Check the source response, codec support and provider playback requirements.';
-}
-
-async function fitPlayer(player) {
-    const elements = await player.frame.$$('video');
-    try {
-        const target = elements[player.data.index];
-        if (target) await target.evaluate(fitElement);
-    } finally {
-        await Promise.all(elements.map(el => el.dispose()));
-    }
-    for (let f = player.frame; f.parentFrame(); f = f.parentFrame()) {
-        const host = await f.frameElement();
-        if (!host) break;
-        try { await host.evaluate(fitElement); } finally { await host.dispose(); }
-    }
-}
-
-// The workflow uses X11 display capture. Minimize only windows owned by this OBS process.
-async function keepChromeVisible(s) {
-    if ((process.env.WINDOW_KEEPER || 'ON').toUpperCase() === 'OFF') return;
-    const { stdout } = await exec('xdotool', ['search', '--onlyvisible', '--pid', String(s.child.pid)],
-        { timeout: 2000 }).catch(() => ({ stdout: '' }));
-    const ids = stdout.trim().split(/\s+/).filter(id => /^\d+$/.test(id));
-    for (const id of ids) await exec('xdotool', ['windowminimize', id], { timeout: 2000 }).catch(() => {});
-    if (ids.length) await s.page.bringToFront();
-}
-
-async function runSession(s, cfg, signal, status) {
-    await startBrowser(s, cfg);
-    await checkWidevine(s.page).catch(err => {
-        console.warn('Widevine check inconclusive: ' + safeMessage(err));
-    });
-    signal.throwIfAborted();
-    await s.page.evaluateOnNewDocument(observeMediaEvents);
-    const target = cfg.urls[0];
-    console.log('Opening ' + new URL(target).hostname);
-    const response = await s.page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    if (response?.status() >= 400) throw new Error('Source page returned HTTP ' + response.status());
-    let previous, player;
-    let lastDiagnostic = '', selected = false, publishing = false, liveScene = false;
-    let lastChange = Date.now(), lastSent = 0, bytes = 0, nextKeeper = 0, nextReport = 0;
-    const clicked = new WeakSet();
-    while (!signal.aborted) {
-        if (s.obsFailure) throw s.obsFailure;
-        if (s.pageFailed || s.page.isClosed() || !s.browser.connected) throw new Error('Chrome or its player tab closed.');
-        if (!publishing && !selected && cfg.server && cfg.server.toLowerCase() !== 'none') {
-            for (const frame of s.page.frames()) {
-                selected = await frame.evaluate(label => {
-                    const btn = [...document.querySelectorAll('button,a,[role="button"]')].find(el =>
-                        el.getClientRects().length && el.innerText?.trim().toLowerCase() === label);
-                    if (btn) btn.click();
-                    return Boolean(btn);
-                }, cfg.server.toLowerCase()).catch(() => false);
-                if (selected) break;
-            }
-        }
-        player = await getPlayer(s.page);
-        const data = player?.data;
-        const changed = player?.frame !== previous?.frame || data?.index !== previous?.data.index;
-        const moving = data && previous && !changed && !data.paused && !data.error && data.ready >= 2 &&
-            (data.time > previous.data.time + 0.02 || (data.frames !== null && data.frames > previous.data.frames));
-        if (!player && !publishing) {
-            for (const frame of s.page.frames().filter(f => !clicked.has(f))) {
-                const acted = await frame.evaluate(() => {
-                    const btn = document.querySelector('.vjs-big-play-button,.jw-icon-display,button[aria-label="Play"]');
-                    if (!btn?.getClientRects().length) return false;
-                    btn.click();
-                    return true;
-                }).catch(() => false);
-                if (acted) clicked.add(frame);
-            }
-        } else if (player && (!publishing || changed)) {
-            await player.frame.evaluate((index, audible) => {
-                const v = document.querySelectorAll('video')[index];
-                if (!v) return;
-                v.muted = !audible;
-                if (audible && !v.volume) v.volume = 1;
-                if (v.paused && !v.ended) v.play().catch(() => {});
-            }, data.index, cfg.audio === 'ON').catch(() => {});
-        }
-        if (moving) {
-            lastChange = Date.now();
-            if (!publishing) {
-                await startObs(s, cfg, signal);
-                await s.page.bringToFront();
-                await keepChromeVisible(s);
-                await fitPlayer(player);
-                signal.throwIfAborted();
-                await s.call('SetCurrentProgramScene', { sceneName: 'Program' });
-                liveScene = true;
-                await s.call('StartStream');
-                publishing = true;
-                lastChange = lastSent = Date.now();
-            } else if (!liveScene) {
-                await fitPlayer(player);
-                await s.call('SetCurrentProgramScene', { sceneName: 'Program' });
-                liveScene = true;
-            }
+        if (result.supported) {
+            console.log(`[✅ Widevine CDM] Supported (${result.keySystem})`);
         } else {
-            const msg = diagnostic(data);
-            if (msg !== lastDiagnostic) {
-                console.log('Player: ' + msg);
-                lastDiagnostic = msg;
-            }
-            if (liveScene && Date.now() - lastChange > 12_000) {
-                await s.call('SetCurrentProgramScene', { sceneName: 'Standby' });
-                liveScene = false;
-            }
-            if (Date.now() - lastChange > 90_000) throw new Error('Playback stalled. ' + msg + '. ' + stallHint(data));
+            console.error(`[❌ Widevine CDM] Unavailable (${result.error})`);
         }
-        if (publishing) {
-            if (Date.now() >= nextKeeper) {
-                await keepChromeVisible(s);
-                nextKeeper = Date.now() + 5000;
-            }
-            const out = await s.call('GetStreamStatus');
-            if (out.outputActive && !out.outputReconnecting && out.outputBytes > bytes) {
-                lastSent = Date.now();
-                if (moving) {
-                    status.lastLive = lastSent;
-                    if (lastSent >= nextReport) {
-                        console.log('Playback advancing. OBS is transmitting.');
-                        nextReport = lastSent + MINUTE;
-                    }
+        return result;
+    } catch (e) {
+        console.error('[⚠️ Widevine Check Error]:', e.message);
+        return { supported: false, error: e.message };
+    }
+}
+
+async function verifyPlaybackTelemetry(page, http403Urls) {
+    const frameResults = [];
+    for (const frame of page.frames()) {
+        if (frame.isDetached()) continue;
+        try {
+            const info = await frame.evaluate(async () => {
+                const errEl = document.querySelector('.jw-error-msg, .jw-title-primary, [class*="error"]');
+                const errText = errEl ? (errEl.innerText |
+
+| '').trim() : '';
+                const bodyText = document.body ? (document.body.innerText |
+
+| '').slice(0, 400) : '';
+                const hasProtectedError = /problem providing access to protected content|232403|233403|225403/i.test(errText + ' ' + bodyText);
+
+                const v = document.querySelector('video');
+                if (!v) return { hasVideo: false, hasProtectedError, errText };
+
+                const startTime = v.currentTime;
+                let callbackFrames = 0;
+                let lastPresented = 0;
+
+                if (typeof v.requestVideoFrameCallback === 'function') {
+                    await new Promise((resolve) => {
+                        let done = false;
+                        const finish = () => { if (!done) { done = true; resolve(); } };
+                        const timer = setTimeout(finish, 3000);
+                        const onFrame = (_now, meta) => {
+                            callbackFrames++;
+                            lastPresented = meta.presentedFrames |
+
+| callbackFrames;
+                            if (callbackFrames >= 3) {
+                                clearTimeout(timer);
+                                finish();
+                            } else {
+                                v.requestVideoFrameCallback(onFrame);
+                            }
+                        };
+                        v.requestVideoFrameCallback(onFrame);
+                    });
+                } else {
+                    await new Promise(r => setTimeout(r, 2500));
                 }
+
+                return {
+                    hasVideo: true,
+                    paused: v.paused,
+                    readyState: v.readyState,
+                    startTime,
+                    endTime: v.currentTime,
+                    callbackFrames,
+                    presentedFrames: lastPresented,
+                    hasProtectedError,
+                    errText
+                };
+            });
+            if (info && (info.hasVideo |
+
+| info.hasProtectedError)) {
+                frameResults.push(info);
             }
-            bytes = out.outputBytes;
-            if (Date.now() - lastSent > 45_000) throw new Error('OBS stopped transmitting to OK.ru.');
-        }
-        previous = player;
-        await sleep(2000, undefined, { signal });
+        } catch (e) {}
     }
+
+    const playing = frameResults.some(r => r.hasVideo && (r.endTime > r.startTime |
+
+| r.callbackFrames >= 2) && !r.hasProtectedError);
+    console.log('[📊 Playback Telemetry]:', JSON.stringify({ playing, http403Count: http403Urls.length, frames: frameResults }));
+    if (http403Urls.length > 0) {
+        console.error('[🚫 HTTP 403 Blocked URLs (causes JW 232403/233403)]:', http403Urls.slice(0, 5));
+    }
+    return { playing, frameResults };
 }
 
-async function supervise(cfg, signal, status) {
-    const s = { dir: fs.mkdtempSync(path.join(os.tmpdir(), 'okru-chrome-')), obs: new OBSWebSocket() };
-    s.call = (method, data) => bounded(s.obs.call(method, data), 8000, method);
-    try { await runSession(s, cfg, signal, status); }
-    finally { await closeSession(s); }
+// =========================================================================================
+// 🎥 OBS CONFIGURATION
+// =========================================================================================
+function setupOBSConfig() {
+    const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
+    const profilesDir = path.join(obsDir, 'basic', 'profiles', 'Untitled');
+    const scenesDir = path.join(obsDir, 'basic', 'scenes');
+    const wsPluginDir = path.join(obsDir, 'plugin_config', 'obs-websocket');
+
+    fs.mkdirSync(profilesDir, { recursive: true });
+    fs.mkdirSync(scenesDir, { recursive: true });
+    fs.mkdirSync(wsPluginDir, { recursive: true });
+
+    const baseIni =
+`[General]
+LicenseAccepted=true
+FirstRun=true
+[Basic]
+Profile=Untitled
+ProfileDir=Untitled
+SceneCollection=Untitled
+SceneCollectionFile=Untitled
+[BasicWindow]
+ShowAutoConfig=false
+Warned=true
+[OBSWebSocket]
+ServerEnabled=true
+ServerPort=4455
+ServerPassword=secret
+`;
+    fs.writeFileSync(path.join(obsDir, 'global.ini'), baseIni);
+    fs.writeFileSync(path.join(obsDir, 'user.ini'), baseIni);
+
+    fs.writeFileSync(path.join(wsPluginDir, 'config.json'), JSON.stringify({
+        alerts_enabled: false,
+        auth_required: true,
+        first_load: false,
+        server_enabled: true,
+        server_password: "secret",
+        server_port: 4455
+    }, null, 2));
+
+    fs.writeFileSync(path.join(profilesDir, 'basic.ini'),
+`[General]
+Name=Untitled
+[Video]
+BaseCX=${RES_W}
+BaseCY=${RES_H}
+OutputCX=${RES_W}
+OutputCY=${RES_H}
+FPSCommon=30
+[Output]
+Mode=Advanced
+[AdvOut]
+TrackIndex=1
+RecType=Standard
+Encoder=obs_x264
+[obs_x264]
+bitrate=${BITRATE}
+keyint_sec=2
+preset=ultrafast
+profile=main
+tune=zerolatency
+rate_control=CBR
+`);
+
+    fs.writeFileSync(path.join(profilesDir, 'service.json'), JSON.stringify({
+        settings: { server: "rtmp://vsu.okcdn.ru/input/", key: ACTIVE_STREAM_KEY.trim() },
+        type: "rtmp_custom"
+    }, null, 2));
+
+    fs.writeFileSync(path.join(scenesDir, 'Untitled.json'), JSON.stringify({
+        current_scene: "MainScene",
+        current_program_scene: "MainScene",
+        name: "Untitled",
+        scene_order: [{ name: "MainScene" }],
+        sources: [
+            { id: "xshm_input", name: "Screen", settings: { screen: 0, show_cursor: false } },
+            { id: "pulse_output_capture", name: "Audio", settings: {} },
+            { id: "scene", name: "MainScene", settings: { items: [{ name: "Screen", id: 1, visible: true }, { name: "Audio", id: 2, visible: true }] } }
+        ]
+    }, null, 2));
 }
 
-async function browserCheck() {
-    if (!process.env.DISPLAY) throw new Error('Run xvfb-run -a node stream.js --check-browser on Linux.');
-    const s = { dir: fs.mkdtempSync(path.join(os.tmpdir(), 'okru-chrome-check-')) };
+// =========================================================================================
+// 🪟 WINDOW CONTROL
+// =========================================================================================
+function sh(cmd) {
+    try { execSync(cmd, { stdio: 'ignore', timeout: 5000 }); } catch (e) {}
+}
+
+function checkXdotool() {
     try {
-        await startBrowser(s, { width: 1280, height: 720, audio: 'OFF', proxy: 'None' });
-        if (!await checkWidevine(s.page)) throw new Error('Chrome could not initialize Widevine with either tested codec.');
-    } finally { await closeSession(s); }
+        execSync('which xdotool', { stdio: 'ignore' });
+    } catch (e) {
+        console.error('[⚠️] xdotool is NOT installed - OBS windows cannot be hidden.');
+    }
 }
 
-async function closeSession(s) {
-    const jobs = [];
-    if (s.browser) {
-        jobs.push(bounded(s.browser.close(), 4000, 'Browser close').catch(() => {
-            s.browser.process()?.kill('SIGKILL');
-        }));
-    }
-    if (s.child) {
-        jobs.push((async () => {
-            if (!s.obsFailure) {
-                await bounded(s.obs.call('StopStream'), 2500, 'Stop stream').catch(() => {});
+function hideOBSWindows() {
+    sh('xdotool search --name "Auto-Configuration Wizard" windowquit');
+    sh('xdotool search --class "obs" windowminimize windowmove 20000 20000');
+    sh('xdotool search --name "^OBS " windowminimize windowmove 20000 20000');
+}
+
+function focusChrome() {
+    const place = `windowsize ${RES_W} ${RES_H} windowmove 0 0 windowraise windowactivate`;
+    if (browserPid) sh(`xdotool search --onlyvisible --pid ${browserPid} ${place}`);
+    sh(`xdotool search --onlyvisible --class "[Cc]hrom" ${place}`);
+}
+
+function hideOBSAndFocusChrome() {
+    hideOBSWindows();
+    focusChrome();
+}
+
+function startWindowKeeper() {
+    if (WINDOW_KEEPER === 'OFF' |
+
+| keeperTimer) return;
+    keeperTimer = setInterval(hideOBSAndFocusChrome, 2000);
+}
+
+// =========================================================================================
+// 🎬 ONE-TIME PLAY & FULLSCREEN TRIGGER
+// =========================================================================================
+async function playAndMaximizeOnce(page) {
+    for (const frame of page.frames()) {
+        if (frame.isDetached()) continue;
+        await frame.evaluate((audioEnabled) => {
+            document.documentElement.style.background = '#000';
+            if (document.body) {
+                document.body.style.background = '#000';
+                document.body.style.overflow = 'hidden';
+                document.body.style.margin = '0';
             }
-            await bounded(s.obs.disconnect(), 1500, 'Disconnect').catch(() => {});
-            if (!s.obsFailure) {
-                s.child.kill('SIGTERM');
-                try { await bounded(s.exited, 4000, 'OBS exit'); }
-                catch { s.child.kill('SIGKILL'); await bounded(s.exited, 2000, 'OBS exit'); }
+
+            const selectors = '.jw-icon-display, .jw-icon-playback, button[data-plyr="play"], .vjs-big-play-button, .vjs-play-control, [class*="unmute"], .fp-play, video';
+            document.querySelectorAll(selectors).forEach(el => { try { el.click(); } catch (e) {} });
+
+            const v = document.querySelector('video');
+            if (v) {
+                if (v.paused) v.play().catch(() => {});
+                v.muted = !audioEnabled;
+                v.volume = audioEnabled ? 1.0 : 0.0;
+                const wrap = v.closest('.jwplayer, #player, .plyr, .vjs-player, [data-player]') |
+
+| v;
+                wrap.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:#000 !important;';
+                v.style.cssText = 'width:100% !important;height:100% !important;object-fit:contain !important;';
+                return;
             }
-        })());
+
+            const iframes = Array.from(document.querySelectorAll('iframe'));
+            let best = null, maxArea = 5000;
+            iframes.forEach(f => {
+                const area = f.clientWidth * f.clientHeight;
+                if (area > maxArea && f.clientWidth >= f.clientHeight) { maxArea = area; best = f; }
+            });
+            if (best) {
+                iframes.forEach(f => { if (f !== best) f.style.display = 'none'; });
+                best.style.cssText = 'position:fixed !important;top:0 !important;left:0 !important;width:100vw !important;height:100vh !important;z-index:2147483645 !important;border:none !important;background:#000 !important;';
+            }
+        }, ENABLE_STREAM_AUDIO).catch(() => {});
     }
-    try { await Promise.all(jobs); }
-    finally { await fs.promises.rm(s.dir, { force: true, recursive: true, maxRetries: 3, retryDelay: 200 }); }
 }
 
-async function jobBudget(signal) {
-    // The six-hour job limit also counts apt, npm, Chrome and virtual display setup.
-    const fallback = 320 * MINUTE;
-    try {
-        const repo = process.env.GITHUB_REPOSITORY;
-        const run = process.env.GITHUB_RUN_ID;
-        const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
-        const result = await exec('gh', ['api', 'repos/' + repo + '/actions/runs/' + run +
-            '/attempts/' + attempt + '/jobs'], { timeout: 8000, signal });
-        const running = JSON.parse(result.stdout).jobs.filter(j => j.status === 'in_progress');
-        const job = running.find(j => j.name === process.env.GITHUB_JOB) || (running.length === 1 && running[0]);
-        const start = Date.parse(job?.started_at);
-        if (Number.isFinite(start)) return Math.max(1000, Math.min(350 * MINUTE, start + 350 * MINUTE - Date.now()));
-    } catch {
-        signal.throwIfAborted();
-    }
-    console.warn('Job start time unavailable. Reserving 40 minutes for setup and handoff.');
-    return fallback;
-}
+// =========================================================================================
+// 🚀 MAIN STARTUP
+// =========================================================================================
+async function startSimpleBroadcast() {
+    console.log(`[🚀] Starting Broadcast: ${RES_W}x${RES_H} @ ${BITRATE}kbps | Channel: ${SELECTED_CHANNEL}`);
+    checkXdotool();
+    setupOBSConfig();
+    fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true });
 
-async function handoff(cfg, remaining, signal) {
-    const repository = process.env.GITHUB_REPOSITORY;
-    const ref = process.env.GITHUB_REF_NAME;
-    const workflowRef = process.env.GITHUB_WORKFLOW_REF || '';
-    const prefix = repository + '/.github/workflows/';
-    const workflow = workflowRef.slice(prefix.length).split('@')[0];
-    if (!workflowRef.startsWith(prefix) || !/^[\w. -]+\.ya?ml$/i.test(workflow) || !ref) {
-        throw new Error('Cannot identify the workflow and ref for the next run.');
-    }
-    const inputs = {
-        target_urls: cfg.raw, okru_stream_channel: cfg.channel, server_selection: cfg.server,
-        stream_quality: cfg.quality, proxy_engine: cfg.proxy, enable_stream_audio: cfg.audio,
-        custom_duration: remaining === Infinity ? '24/7' : Math.ceil(remaining / 1000) + 's',
-    };
-    const args = ['workflow', 'run', workflow, '--repo', repository, '--ref', ref];
-    for (const [name, value] of Object.entries(inputs)) args.push('-f', name + '=' + value);
-    // A timed-out dispatch can have reached GitHub. Repeating it can create two publishers.
-    try { await exec('gh', args, { timeout: 20_000, signal }); }
-    catch (err) {
-        signal.throwIfAborted();
-        const detail = String(err.stderr || '').match(/HTTP \d{3}/i)?.[0] || err.code || 'timeout';
-        throw new Error('Workflow dispatch could not be confirmed (' + detail + '). Check Actions run history.');
-    }
-    console.log('GitHub accepted the next workflow run.');
-}
+    obsProcess = spawn('obs', [
+        '--startstreaming',
+        '--minimize-to-tray',
+        '--disable-updater',
+        '--disable-shutdown-check',
+        '--disable-missing-files-check'
+    ], {
+        env: { ...process.env, DISPLAY: process.env.DISPLAY |
 
-async function main() {
-    const cfg = settings(process.env);
-    if (!process.env.DISPLAY) throw new Error('DISPLAY is missing. Launch stream.js inside the workflow Xvfb session.');
-    const life = new AbortController();
-    const cancel = () => life.abort(new Error('Workflow cancelled.'));
-    process.once('SIGTERM', cancel);
-    process.once('SIGINT', cancel);
-    let timer;
-    try {
-        const budget = process.env.GITHUB_ACTIONS === 'true' ? await jobBudget(life.signal) : Infinity;
-        const slice = Math.min(cfg.duration, budget);
-        const status = { index: 0, lastLive: 0, started: Date.now() };
-        const session = new AbortController();
-        const signal = AbortSignal.any([session.signal, life.signal]);
-        // Long local durations can exceed Node's maximum individual timeout.
-        const deadline = status.started + slice;
-        function armTimer() {
-            const left = deadline - Date.now();
-            if (left <= 0) session.abort(new Error('Duration reached.'));
-            else if (Number.isFinite(left)) timer = setTimeout(armTimer, Math.min(left, 2_147_483_647));
+| ':99' },
+        stdio: 'ignore'
+    });
+
+    startWindowKeeper();
+    await new Promise(r => setTimeout(r, 6000));
+
+    for (let i = 0; i < 12; i++) {
+        try {
+            await obs.connect('ws://127.0.0.1:4455', 'secret');
+            const status = await obs.call('GetStreamStatus');
+            if (!status.outputActive) await obs.call('StartStream');
+            console.log('[+] OBS Streaming Active!');
+            break;
+        } catch (e) {
+            await new Promise(r => setTimeout(r, 2000));
         }
-        armTimer();
-        console.log('Starting OK.ru channel ' + cfg.channel + ' at ' + cfg.quality + ', audio ' + cfg.audio + '.');
-        try { await supervise(cfg, signal, status); }
-        catch (err) { if (!signal.aborted) throw err; }
-        life.signal.throwIfAborted();
-        if (!status.lastLive) throw new Error('Duration ended before OBS confirmed outgoing media.');
-        if (Date.now() - status.lastLive > 90_000 && cfg.duration <= slice) {
-            throw new Error('Duration ended during an extended source or output outage.');
-        }
-        if (cfg.duration > slice) await handoff(cfg, cfg.duration - slice, life.signal);
-        else console.log('Requested duration complete.');
-    } finally {
-        clearTimeout(timer);
-        process.removeListener('SIGTERM', cancel);
-        process.removeListener('SIGINT', cancel);
     }
+
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        `--window-size=${RES_W},${RES_H}`,
+        '--window-position=0,0',
+        '--kiosk',
+        '--start-fullscreen',
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+    ];
+
+    if (PROXY_ENGINE.includes('Cloudflare')) {
+        const warpUp = await isPortOpen('127.0.0.1', 40000);
+        if (warpUp) {
+            console.log('[+] WARP SOCKS5 port 40000 is open -> routing Chrome through socks5://127.0.0.1:40000');
+            args.push('--proxy-server=socks5://127.0.0.1:40000');
+        } else {
+            console.warn('[⚠️] PROXY_ENGINE requested WARP, but 127.0.0.1:40000 is NOT listening -> launching direct.');
+        }
+    }
+
+    // CRITICAL FIXES FOR PROTECTED CONTENT / WIDEVINE:
+    // 1. channel: 'chrome' -> uses Google Chrome (with WidevineCdm), not bundled Chrome for Testing
+    // 2. ignoreDefaultArgs includes '--disable-component-update' -> allows WidevineCdm to initialize
+    // 3. userDataDir -> persistent writable profile for CDM state
+    browser = await puppeteer.launch({
+        channel: 'chrome',
+        headless: false,
+        userDataDir: CHROME_PROFILE_DIR,
+        defaultViewport: { width: RES_W, height: RES_H },
+        ignoreDefaultArgs: ['--enable-automation', '--disable-component-update'],
+        args
+    });
+    try { browserPid = browser.process().pid; } catch (e) {}
+
+    const page = (await browser.pages())[0];
+    await page.evaluateOnNewDocument(() => { window.open = () => null; });
+
+    const http403Urls = [];
+    page.on('response', (res) => {
+        const status = res.status();
+        const url = res.url();
+        if (status === 403 && /\.(m3u8|mpd|ts|m4s|mp4|key)(\?|$)|license|drm|widevine/i.test(url)) {
+            http403Urls.push(url);
+        }
+    });
+
+    browser.on('targetcreated', async (target) => {
+        if (target.type() === 'page') {
+            const popup = await target.page().catch(() => null);
+            if (popup && popup !== page) popup.close().catch(() => {});
+        }
+    });
+
+    // Try candidate URLs in order until one passes playback telemetry
+    for (const url of candidateUrls) {
+        http403Urls.length = 0;
+        console.log(`[🌐] Opening URL: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        hideOBSAndFocusChrome();
+
+        await checkWidevineCapability(page);
+
+        await new Promise(r => setTimeout(r, 4000));
+        await playAndMaximizeOnce(page);
+        await new Promise(r => setTimeout(r, 5000));
+        await playAndMaximizeOnce(page);
+        hideOBSAndFocusChrome();
+
+        const { playing } = await verifyPlaybackTelemetry(page, http403Urls);
+        if (playing) {
+            console.log(`[✅] Verified active playback on ${url}`);
+            break;
+        } else {
+            console.warn(`[⚠️] Playback not confirmed on ${url}; trying next fallback URL if available.`);
+        }
+    }
+
+    console.log('[📡] Live Broadcast Running.');
 }
 
-if (require.main === module) {
-    (process.argv.includes('--check-browser') ? browserCheck() : main()).catch(err => { console.error(safeMessage(err)); process.exitCode = 1; });
+async function cleanup() {
+    if (keeperTimer) { clearInterval(keeperTimer); keeperTimer = null; }
+    try { await obs.call('StopStream'); } catch (e) {}
+    try { await obs.disconnect(); } catch (e) {}
+    if (browser) { try { await browser.close(); } catch (e) {} }
+    if (obsProcess) { try { obsProcess.kill('SIGKILL'); } catch (e) {} }
+    try { execSync('pkill -9 obs chrome |
+
+| true', { stdio: 'ignore' }); } catch (e) {}
 }
+
+// =========================================================================================
+// ⏱️ DURATION TIMER
+// =========================================================================================
+const RAW_DURATION = (process.env.CUSTOM_DURATION |
+
+| '24/7').trim();
+const MAX_SINGLE_RUN_MS = 21000000; // 5h 50m
+
+function parseFlexibleDuration(input) {
+    const str = (input |
+
+| '').toLowerCase().trim();
+    if (!str |
+
+| str === '24/7' |
+| str === 'infinite' |
+| str === '0') return null;
+    let totalMs = 0, matched = false;
+    const regex = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/g;
+    let match;
+    while ((match = regex.exec(str)) !== null) {
+        matched = true;
+        const val = parseFloat(match[1]);
+        if (match[2].startsWith('h')) totalMs += val * 3600000;
+        else if (match[2].startsWith('m')) totalMs += val * 60000;
+        else if (match[2].startsWith('s')) totalMs += val * 1000;
+    }
+    if (!matched && /^\d+(\.\d+)?$/.test(str)) { totalMs = parseFloat(str) * 60000; matched = true; }
+    return (matched && totalMs > 0) ? Math.round(totalMs) : null;
+}
+
+function formatMsToDurationString(ms) {
+    const totalSec = Math.max(1, Math.round(ms / 1000));
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    return [h > 0 ? `${h}h` : '', m > 0 ? `${m}m` : ''].filter(Boolean).join(' ') |
+
+| '1m';
+}
+
+function triggerNextWorkflow(nextDurationValue) {
+    const args = [
+        'workflow', 'run', 'main.yml',
+        '-f', `target_urls=${process.env.TARGET_URLS |
+
+| ''}`,
+        '-f', `okru_stream_channel=${SELECTED_CHANNEL}`,
+        '-f', `stream_quality=${selectedQuality}`,
+        '-f', `proxy_engine=${PROXY_ENGINE}`,
+        '-f', `enable_stream_audio=${process.env.ENABLE_STREAM_AUDIO |
+
+| 'ON'}`,
+        '-f', `custom_duration=${nextDurationValue}`
+    ];
+    const res = spawn('gh', args, { stdio: 'inherit' });
+    res.on('close', () => {
+        setTimeout(async () => { await cleanup(); process.exit(0); }, 60000);
+    });
+}
+
+const totalRequestedMs = parseFlexibleDuration(RAW_DURATION);
+if (totalRequestedMs === null) {
+    setTimeout(() => triggerNextWorkflow('24/7'), MAX_SINGLE_RUN_MS);
+} else if (totalRequestedMs <= MAX_SINGLE_RUN_MS) {
+    setTimeout(async () => { await cleanup(); process.exit(0); }, totalRequestedMs);
+} else {
+    const nextStr = formatMsToDurationString(totalRequestedMs - MAX_SINGLE_RUN_MS);
+    setTimeout(() => triggerNextWorkflow(nextStr), MAX_SINGLE_RUN_MS);
+}
+
+startSimpleBroadcast();
 
 
 
