@@ -1,9 +1,6 @@
 
 
 
-
-
-
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -26,6 +23,8 @@ const selectedQuality = process.env.STREAM_QUALITY || '720p';
 const PROXY_ENGINE = process.env.PROXY_ENGINE || 'Cloudflare WARP (Recommended)';
 const ENABLE_STREAM_AUDIO = process.env.ENABLE_STREAM_AUDIO !== 'OFF';
 const SELECTED_CHANNEL = (process.env.OKRU_STREAM_ID || '1').trim();
+// Set WINDOW_KEEPER=OFF to disable the background "keep Chrome in front / hide OBS" loop.
+const WINDOW_KEEPER = (process.env.WINDOW_KEEPER || 'ON').trim().toUpperCase();
 
 let RES_W = 1280, RES_H = 720, BITRATE = 3000;
 if (selectedQuality === '360p') { RES_W = 640; RES_H = 360; BITRATE = 800; }
@@ -109,10 +108,12 @@ const targetUrl = rawUrls
     .filter(u => u.length > 8)[0] || 'https://dadocric.st/player.php?id=starsp3&v=m';
 
 let browser = null;
+let browserPid = null;
 let obsProcess = null;
+let keeperTimer = null;
 
 // =========================================================================================
-// 🎥 OBS CONFIGURATION (Auto-Config Wizard Disabled)
+// 🎥 OBS CONFIGURATION
 // =========================================================================================
 function setupOBSConfig() {
     const obsDir = path.join(os.homedir(), '.config', 'obs-studio');
@@ -124,10 +125,20 @@ function setupOBSConfig() {
     fs.mkdirSync(scenesDir, { recursive: true });
     fs.mkdirSync(wsPluginDir, { recursive: true });
 
-    fs.writeFileSync(path.join(obsDir, 'global.ini'),
+    // FIX #1: In OBS, "FirstRun=true" means "the first run already happened".
+    // The old value (false) told OBS to open the Auto-Configuration Wizard on every launch,
+    // and that wizard window was what covered Chrome in the stream.
+    // OBS 31+ also split its settings into global.ini (app) and user.ini (user),
+    // so the same content is written to both to cover every version.
+    const baseIni =
 `[General]
 LicenseAccepted=true
 FirstRun=true
+[Basic]
+Profile=Untitled
+ProfileDir=Untitled
+SceneCollection=Untitled
+SceneCollectionFile=Untitled
 [BasicWindow]
 ShowAutoConfig=false
 Warned=true
@@ -135,7 +146,9 @@ Warned=true
 ServerEnabled=true
 ServerPort=4455
 ServerPassword=secret
-`);
+`;
+    fs.writeFileSync(path.join(obsDir, 'global.ini'), baseIni);
+    fs.writeFileSync(path.join(obsDir, 'user.ini'), baseIni);
 
     fs.writeFileSync(path.join(wsPluginDir, 'config.json'), JSON.stringify({
         alerts_enabled: false,
@@ -181,7 +194,8 @@ rate_control=CBR
         name: "Untitled",
         scene_order: [{ name: "MainScene" }],
         sources: [
-            { id: "xshm_input", name: "Screen", settings: { show_cursor: false } },
+            // screen: 0 is set explicitly because OBS 31+ no longer captures a display "implicitly" on Linux
+            { id: "xshm_input", name: "Screen", settings: { screen: 0, show_cursor: false } },
             { id: "pulse_output_capture", name: "Audio", settings: {} },
             { id: "scene", name: "MainScene", settings: { items: [{ name: "Screen", id: 1, visible: true }, { name: "Audio", id: 2, visible: true }] } }
         ]
@@ -189,15 +203,45 @@ rate_control=CBR
 }
 
 // =========================================================================================
-// 🪟 HIDE OBS INTERFACE & KEEP CHROME ON TOP
+// 🪟 WINDOW CONTROL (keeps OBS out of the picture, Chrome in front)
 // =========================================================================================
-function hideOBSAndFocusChrome() {
+function sh(cmd) {
+    try { execSync(cmd, { stdio: 'ignore', timeout: 5000 }); } catch (e) {}
+}
+
+function checkXdotool() {
     try {
-        execSync('xdotool search --name "Auto-Configuration" windowkill || true', { stdio: 'ignore' });
-        execSync('xdotool search --name "OBS" windowmove 5000 5000 windowminimize || true', { stdio: 'ignore' });
-        execSync(`xdotool search --onlyvisible --class "chrome" windowmove 0 0 windowsize ${RES_W} ${RES_H} windowactivate || true`, { stdio: 'ignore' });
-        execSync('wmctrl -a "Chrome" || true', { stdio: 'ignore' });
-    } catch (e) {}
+        execSync('which xdotool', { stdio: 'ignore' });
+    } catch (e) {
+        console.error('[⚠️] xdotool is NOT installed - OBS windows cannot be hidden. Add "sudo apt-get install -y xdotool" to your workflow.');
+    }
+}
+
+// FIX #2: The screen capture records the whole display, so any visible OBS window (main window,
+// wizard, "safe mode" prompt, docks) ends up in the stream. Every window OBS owns shares the
+// "obs" window class, so minimize them and park them far outside the visible screen.
+function hideOBSWindows() {
+    sh('xdotool search --name "Auto-Configuration Wizard" windowquit');
+    sh('xdotool search --class "obs" windowminimize windowmove 20000 20000');
+    sh('xdotool search --name "^OBS " windowminimize windowmove 20000 20000');
+}
+
+function focusChrome() {
+    const place = `windowsize ${RES_W} ${RES_H} windowmove 0 0 windowraise windowactivate`;
+    if (browserPid) sh(`xdotool search --onlyvisible --pid ${browserPid} ${place}`);
+    sh(`xdotool search --onlyvisible --class "[Cc]hrom" ${place}`);
+}
+
+function hideOBSAndFocusChrome() {
+    hideOBSWindows();
+    focusChrome();
+}
+
+// FIX #3: The old script did this only once, so anything that popped up later (wizard, dialogs)
+// stayed on top forever. This loop only moves windows - it never reloads or touches the page.
+function startWindowKeeper() {
+    if (WINDOW_KEEPER === 'OFF' || keeperTimer) return;
+    keeperTimer = setInterval(hideOBSAndFocusChrome, 2000);
 }
 
 // =========================================================================================
@@ -247,14 +291,27 @@ async function playAndMaximizeOnce(page) {
 // =========================================================================================
 async function startSimpleBroadcast() {
     console.log(`[🚀] Starting Simple Broadcast: ${RES_W}x${RES_H} @ ${BITRATE}kbps | Channel: ${SELECTED_CHANNEL}`);
+    checkXdotool();
     setupOBSConfig();
 
-    obsProcess = spawn('obs', ['--startstreaming', '--minimize-to-tray', '--disable-updater'], {
-        env: { ...process.env, DISPLAY: process.env.DISPLAY || ':99' }
+    // --disable-shutdown-check / --disable-missing-files-check stop OBS from opening
+    // "safe mode" or "missing files" dialogs, which would also end up on screen.
+    // stdio is ignored so OBS can never block on an undrained output pipe during long runs.
+    obsProcess = spawn('obs', [
+        '--startstreaming',
+        '--minimize-to-tray',
+        '--disable-updater',
+        '--disable-shutdown-check',
+        '--disable-missing-files-check'
+    ], {
+        env: { ...process.env, DISPLAY: process.env.DISPLAY || ':99' },
+        stdio: 'ignore'
     });
 
+    // Start hiding OBS windows immediately, before Chrome even exists.
+    startWindowKeeper();
+
     await new Promise(r => setTimeout(r, 6000));
-    hideOBSAndFocusChrome();
 
     for (let i = 0; i < 12; i++) {
         try {
@@ -283,8 +340,7 @@ async function startSimpleBroadcast() {
         ignoreDefaultArgs: ['--enable-automation'],
         args
     });
-
-    hideOBSAndFocusChrome();
+    try { browserPid = browser.process().pid; } catch (e) {}
 
     const page = (await browser.pages())[0];
     await page.evaluateOnNewDocument(() => { window.open = () => null; });
@@ -300,17 +356,18 @@ async function startSimpleBroadcast() {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     hideOBSAndFocusChrome();
 
-    // Trigger play & fullscreen twice to catch async players, then leave completely alone
+    // Trigger play & fullscreen twice to catch async players, then leave the page completely alone
     await new Promise(r => setTimeout(r, 4000));
     await playAndMaximizeOnce(page);
     await new Promise(r => setTimeout(r, 5000));
     await playAndMaximizeOnce(page);
     hideOBSAndFocusChrome();
 
-    console.log('[📡] Live Broadcast Running (OBS Hidden, Chrome Fullscreen).');
+    console.log('[📡] Live Broadcast Running (page is never reloaded; window keeper only keeps Chrome in front).');
 }
 
 async function cleanup() {
+    if (keeperTimer) { clearInterval(keeperTimer); keeperTimer = null; }
     try { await obs.call('StopStream'); } catch (e) {}
     try { await obs.disconnect(); } catch (e) {}
     if (browser) { try { await browser.close(); } catch (e) {} }
@@ -375,7 +432,6 @@ if (totalRequestedMs === null) {
 }
 
 startSimpleBroadcast();
-
 
 
 
