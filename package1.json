@@ -1,0 +1,13 @@
+{
+  "name": "stream-bot-obs-test",
+  "version": "1.0.0",
+  "description": "OBS Studio Headed Chrome Widevine Streamer on GitHub Actions",
+  "main": "stream.js",
+  "scripts": {
+    "start": "node stream.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.1.1",
+    "obs-websocket-js": "^5.0.3"
+  }
+}
